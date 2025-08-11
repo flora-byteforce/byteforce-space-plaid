@@ -1,0 +1,147 @@
+import 'dotenv/config';
+import express from 'express';
+import cors from 'cors';
+import Database from 'better-sqlite3';
+import { Configuration, PlaidApi, PlaidEnvironments } from 'plaid';
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+// --- DB setup ---
+const db = new Database(process.env.SQLITE_PATH, { verbose: null });
+db.exec(`
+CREATE TABLE IF NOT EXISTS items (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  item_id TEXT UNIQUE,
+  access_token TEXT NOT NULL,
+  institution_name TEXT,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS cursors (
+  item_id TEXT PRIMARY KEY,
+  cursor TEXT
+);
+`);
+
+const insertItem = db.prepare(`
+  INSERT OR IGNORE INTO items (item_id, access_token, institution_name)
+  VALUES (@item_id, @access_token, @institution_name)
+`);
+const upsertCursor = db.prepare(`
+  INSERT INTO cursors (item_id, cursor) VALUES (@item_id, @cursor)
+  ON CONFLICT(item_id) DO UPDATE SET cursor=@cursor
+`);
+
+// NOTE: use simple quotes here (no backticks needed)
+const getCursor = db.prepare('SELECT cursor FROM cursors WHERE item_id = ?');
+const getAccessTokens = db.prepare('SELECT item_id, access_token FROM items');
+const getOneItem = db.prepare('SELECT * FROM items WHERE item_id = ?');
+
+// --- Plaid client ---
+const config = new Configuration({
+  basePath: PlaidEnvironments[process.env.PLAID_ENV || 'production'],
+  baseOptions: {
+    headers: {
+      'PLAID-CLIENT-ID': process.env.PLAID_CLIENT_ID,
+      'PLAID-SECRET': process.env.PLAID_SECRET,
+    },
+  },
+});
+const plaid = new PlaidApi(config);
+
+// 1) Create Link Token
+app.post('/api/create_link_token', async (req, res) => {
+  try {
+    const userId = 'local-user-1';
+    const redirectUri = process.env.PLAID_REDIRECT_URI || undefined;
+    const createResp = await plaid.linkTokenCreate({
+      user: { client_user_id: userId },
+      client_name: 'Local Budget',
+      products: ['transactions'],
+      country_codes: ['US'],
+      language: 'en',
+      ...(redirectUri ? { redirect_uri: redirectUri } : {}),
+    });
+    res.json({ link_token: createResp.data.link_token });
+  } catch (e) {
+    console.error(e.response?.data || e.message);
+    res.status(500).json({ error: 'create_link_token_failed' });
+  }
+});
+
+// 2) Exchange public_token -> access_token
+app.post('/api/exchange_public_token', async (req, res) => {
+  try {
+    const { public_token, institution_name } = req.body;
+    if (!public_token) return res.status(400).json({ error: 'missing_public_token' });
+
+    const exch = await plaid.itemPublicTokenExchange({ public_token });
+    const { access_token, item_id } = exch.data;
+
+    insertItem.run({ item_id, access_token, institution_name: institution_name || null });
+    res.json({ item_id });
+  } catch (e) {
+    console.error(e.response?.data || e.message);
+    res.status(500).json({ error: 'exchange_failed' });
+  }
+});
+
+// 3) List items
+app.get('/api/items', (req, res) => {
+  const rows = getAccessTokens.all();
+  res.json(rows.map(r => ({ item_id: r.item_id })));
+});
+
+// 4) Transactions Sync
+app.post('/api/transactions/sync', async (req, res) => {
+  try {
+    const { item_id } = req.body;
+    if (!item_id) return res.status(400).json({ error: 'missing_item_id' });
+
+    const row = getOneItem.get(item_id);
+    if (!row) return res.status(404).json({ error: 'unknown_item' });
+
+    let cursor = getCursor.get(item_id)?.cursor || null;
+    let added = [], modified = [], removed = [], hasMore = true;
+
+    while (hasMore) {
+      const resp = await plaid.transactionsSync({
+        access_token: row.access_token,
+        cursor: cursor || undefined,
+        count: 500,
+      });
+      const d = resp.data;
+      added.push(...d.added);
+      modified.push(...d.modified);
+      removed.push(...d.removed);
+      cursor = d.next_cursor;
+      hasMore = d.has_more;
+    }
+
+    upsertCursor.run({ item_id, cursor });
+
+    res.json({
+      item_id,
+      added_count: added.length,
+      modified_count: modified.length,
+      removed_count: removed.length,
+      sample_added: added.slice(0, 5),
+    });
+  } catch (e) {
+    console.error(e.response?.data || e.message);
+    res.status(500).json({ error: 'sync_failed' });
+  }
+});
+
+// OAuth redirect page (static HTML served from /web)
+app.get('/oauth-redirect', (req, res) => {
+  res.sendFile(new URL('../web/oauth-redirect.html', import.meta.url).pathname);
+});
+
+// Serve static frontend
+app.use('/', express.static(new URL('../web', import.meta.url).pathname));
+
+const port = Number(process.env.PORT || 8080);
+console.log(`Server listening on ${process.env.BASE_URL}`);
+app.listen(port);

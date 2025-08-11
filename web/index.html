@@ -1,0 +1,56 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Plaid Local Budget</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <script src="https://cdn.plaid.com/link/v2/stable/link-initialize.js"></script>
+</head>
+<body>
+  <h1>Plaid Local Budget</h1>
+  <button id="link">Connect a bank</button>
+  <pre id="log"></pre>
+
+  <script>
+    const log = (...args) => {
+      const el = document.getElementById('log');
+      el.textContent += args.join(' ') + "\\n";
+    };
+
+    async function createLinkToken() {
+      const resp = await fetch('/api/create_link_token', { method: 'POST' });
+      if (!resp.ok) throw new Error('create_link_token_failed');
+      return (await resp.json()).link_token;
+    }
+
+    async function onSuccess(public_token, metadata) {
+      const resp = await fetch('/api/exchange_public_token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          public_token,
+          institution_name: metadata?.institution?.name || null
+        })
+      });
+      const data = await resp.json();
+      if (!resp.ok) throw new Error(JSON.stringify(data));
+      log('Linked item:', data.item_id, '(', metadata?.institution?.name, ')');
+    }
+
+    async function openLink() {
+      const link_token = await createLinkToken();
+      const handler = Plaid.create({
+        token: link_token,
+        onSuccess,
+        onExit: (err) => {
+          if (err) log('Exit error:', err.error_code || '', err.display_message || '');
+          else log('User exited');
+        }
+      });
+      handler.open();
+    }
+
+    document.getElementById('link').addEventListener('click', openLink);
+  </script>
+</body>
+</html>

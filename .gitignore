@@ -1,0 +1,17 @@
+# Node
+node_modules/
+server/node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Env / secrets
+.env
+server/.env
+
+# Local data
+data/*.db
+
+# OS cruft
+.DS_Store
+Thumbs.db

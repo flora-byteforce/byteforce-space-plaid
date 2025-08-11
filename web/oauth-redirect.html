@@ -1,0 +1,36 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Plaid OAuth Redirect</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <script src="https://cdn.plaid.com/link/v2/stable/link-initialize.js"></script>
+</head>
+<body>
+  <h2>Completing bank connection…</h2>
+  <script>
+    (async () => {
+      const linkTokenResp = await fetch('/api/create_link_token', { method: 'POST' });
+      const { link_token } = await linkTokenResp.json();
+
+      const handler = Plaid.create({
+        token: link_token,
+        receivedRedirectUri: window.location.href,
+        onSuccess: async (public_token, metadata) => {
+          await fetch('/api/exchange_public_token', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              public_token,
+              institution_name: metadata?.institution?.name || null
+            })
+          });
+          window.location.href = '/';
+        },
+        onExit: () => window.location.href = '/'
+      });
+      handler.open();
+    })();
+  </script>
+</body>
+</html>
