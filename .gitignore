@@ -15,3 +15,6 @@ data/*.db
 # OS cruft
 .DS_Store
 Thumbs.db
+data/
+web/dashboard_data.json
+logs/
