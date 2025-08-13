@@ -465,5 +465,88 @@ document.addEventListener("DOMContentLoaded",()=>{ try{document.getElementById("
 
     load().catch(()=>{ $('#lastUpdated').textContent = 'No data yet. Click “Connect a bank” to begin.'; });
   </script>
+<section id="linked-institutions" style="max-width:1100px;margin:32px auto;padding:16px;border:1px solid #e5e7eb;border-radius:16px;background:#fff">
+  <h3 style="margin:0 0 12px 0;font-size:18px;">Linked institutions</h3>
+  <div id="linked-institutions-list" style="display:grid;gap:8px"></div>
+  <small style="color:#6b7280">Use “Upgrade access” to grant Liabilities. Use “Remove” to unlink an institution.</small>
+</section>
 </body>
 </html>
+<script>
+(() => {
+<script>
+(() => {
+<script>
+(() => {
+  const ADMIN_TOKEN = '188320ed631660df204d53df7a23e027a10419bad7263477';
+
+  async function loadItems() {
+    const r = await fetch('/api/balances'); const j = await r.json();
+    const map = new Map();
+    (j.items||[]).forEach(it => {
+      if (it.error) return;
+      const label = (it.accounts && it.accounts[0] && (it.accounts[0].institution || it.accounts[0].official_name || it.accounts[0].name)) || 'Institution';
+      if (!map.has(it.item_id)) map.set(it.item_id, { item_id: it.item_id, label });
+    });
+    return Array.from(map.values());
+  }
+  function html(s,...v){return s.reduce((a,b,i)=>a+b+(v[i]??''),'');}
+
+  async function renderPanel(){
+    const list = document.getElementById('linked-institutions-list'); if(!list) return;
+    list.innerHTML = '<div style="color:#6b7280">Loading…</div>';
+    const items = await loadItems();
+    if(!items.length){ list.innerHTML = '<div style="color:#6b7280">No institutions linked yet.</div>'; return; }
+    list.innerHTML='';
+    for(const {item_id,label} of items){
+      const row = document.createElement('div');
+      row.style.cssText='display:flex;align-items:center;justify-content:space-between;padding:10px 12px;border:1px solid #e5e7eb;border-radius:12px';
+      row.innerHTML = html`
+        <div style="display:flex;gap:8px;align-items:center">
+          <div style="width:8px;height:8px;border-radius:9999px;background:#10b981"></div>
+          <div><div style="font-weight:600">${label}</div>
+          <div style="color:#6b7280;font-size:12px">Item: <code>${item_id}</code></div></div>
+        </div>
+        <div style="display:flex;gap:8px">
+          <button data-upgrade="${item_id}" style="padding:6px 10px;border:1px solid #d1d5db;border-radius:10px;background:#f9fafb;cursor:pointer">Upgrade access</button>
+          <button data-remove="${item_id}" style="padding:6px 10px;border:1px solid #ef4444;border-radius:10px;background:#fef2f2;color:#b91c1c;cursor:pointer">Remove</button>
+        </div>`;
+      list.appendChild(row);
+    }
+
+    list.addEventListener('click', async (e)=>{
+      const up = e.target.closest('button[data-upgrade]');
+      const rm = e.target.closest('button[data-remove]');
+
+      if(up){
+        const item_id = up.getAttribute('data-upgrade');
+        try{
+          const r = await fetch('/api/link_token/update', {
+            method:'POST',
+            headers:{'Content-Type':'application/json','X-Admin-Token':ADMIN_TOKEN},
+            body: JSON.stringify({ item_id, products:['liabilities','transactions','assets'] })
+          });
+          const j = await r.json();
+          if(!r.ok || !j.link_token) throw new Error('failed_to_get_link_token');
+          const h = Plaid.create({ token: j.link_token, onSuccess: ()=>setTimeout(()=>location.reload(), 1500) });
+          h.open();
+        }catch(err){ alert('Upgrade failed: '+(err?.message||'unknown')); }
+      }
+
+      if(rm){
+        const item_id = rm.getAttribute('data-remove');
+        if(!confirm('Remove this institution? This unlinks it and deletes local data.')) return;
+        try{
+          const r = await fetch('/api/items/'+encodeURIComponent(item_id)+'/remove', {
+            method:'POST', headers:{'X-Admin-Token':ADMIN_TOKEN}
+          });
+          if(!r.ok) throw new Error('remove_failed');
+          await fetch('/refresh_dashboard', { method:'POST', headers:{'X-Refresh-Token':ADMIN_TOKEN} });
+          location.reload();
+        }catch(err){ alert('Remove failed: '+(err?.message||'unknown')); }
+      }
+    }, { once:true });
+  }
+  document.addEventListener('DOMContentLoaded', renderPanel);
+})();
+</script>
