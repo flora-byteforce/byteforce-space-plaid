@@ -1,0 +1,543 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Byteforce Budget Dashboard</title>
+
+  <!-- CSP allows Chart.js, Plaid Link, our own API over HTTPS and 127.0.0.1 -->
+  <meta http-equiv="Content-Security-Policy" content="
+    default-src 'self';
+    img-src 'self' data:;
+    style-src 'self' 'unsafe-inline';
+    script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://cdn.jsdelivr.net/npm/chart.js https://cdn.plaid.com;
+    connect-src 'self' https://plaid.byteforce.space http://127.0.0.1:8080 https://cdn.plaid.com https://plaid.com https://*.plaid.com;
+    frame-src https://cdn.plaid.com https://plaid.com https://*.plaid.com;
+  ">
+
+  <style>
+    :root { --bg:#0b0e13; --card:#121622; --muted:#8ea0b6; --text:#e7eef9; --accent:#7dd3fc; --danger:#fda4af; --ok:#86efac; --warn:#fde68a; }
+    *{box-sizing:border-box} body{margin:0;font-family:Inter,system-ui,Segoe UI,Roboto,Arial;background:var(--bg);color:var(--text)}
+    header{padding:24px;border-bottom:1px solid #1f273A;display:flex;gap:12px;justify-content:space-between;align-items:center;flex-wrap:wrap}
+    .title{font-weight:700;letter-spacing:.3px}.last{color:var(--muted);font-size:.9rem}
+    main{padding:24px;max-width:1200px;margin:0 auto;display:grid;gap:24px}
+    .grid{display:grid;gap:24px}.cols-3{grid-template-columns:repeat(3,minmax(0,1fr))}
+    @media (max-width:1000px){.cols-3{grid-template-columns:1fr}}
+    .card{background:var(--card);border:1px solid #1f273A;border-radius:16px;padding:16px 18px;box-shadow:0 10px 30px rgba(0,0,0,.25)}
+    h2{margin:.2rem 0 1rem;font-size:1.1rem;color:#cfe1ff}
+    .row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+    .pill{padding:6px 10px;border:1px solid #24304c;border-radius:999px;background:#10182a;color:#b9cff7;font-size:.85rem}
+    .tag{background:#122031;color:#9bd5ff;padding:2px 8px;border-radius:999px;font-size:.75rem}
+    .muted{color:var(--muted)} .warn{color:var(--danger)} .ok{color:var(--ok)}
+    .money{font-variant-numeric:tabular-nums}
+    table{width:100%;border-collapse:collapse;font-size:.95rem}
+    th,td{padding:10px 8px;border-bottom:1px solid #212a40;text-align:left;vertical-align:top}
+    th{color:#a8c0ff;font-weight:600}
+    input,select,button{background:#0f1524;color:#dbe7ff;border:1px solid #273251;border-radius:10px;padding:8px 10px}
+    button{cursor:pointer} button:disabled{opacity:.6;cursor:not-allowed}
+    .toolbar{display:flex;gap:8px;flex-wrap:wrap}
+    .bar{height:10px;border-radius:999px;background:#243251;overflow:hidden}
+    .bar>span{display:block;height:100%}
+    canvas{width:100%!important;height:320px!important}
+  </style>
+
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script src="https://cdn.plaid.com/link/v2/stable/link-initialize.js"></script>
+</head>
+<body>
+  <header>
+    <div>
+      <div class="title">💰 Byteforce Budget Dashboard</div>
+      <div class="last" id="lastUpdated">Loading…</div>
+    </div>
+    <div class="row">
+      <span class="pill" id="acctCount">0 accounts</span>
+      <span class="pill" id="txCount">0 tx</span>
+      <span class="pill" id="netTotals">—</span>
+      <button id="linkBtn" title="Connect a bank">➕ Connect a bank</button>
+      <button id="refreshBtn" title="Run backend to refresh data">🔄 Refresh Data</button>
+    </div>
+  </header>
+
+  <main>
+    <!-- Controls -->
+    <section class="card">
+      <div class="toolbar">
+        <label>From <input type="date" id="fromDate"></label>
+        <label>To <input type="date" id="toDate"></label>
+        <select id="typeFilter">
+          <option value="all">All</option>
+          <option value="debits">Debits (spend)</option>
+          <option value="credits">Credits (income/refunds)</option>
+        </select>
+        <input id="search" placeholder="Search merchant/category/institution"/>
+        <select id="acctSelector"></select>
+        <select id="sortBy">
+          <option value="date_desc">Date ↓</option>
+          <option value="date_asc">Date ↑</option>
+          <option value="amt_desc">Amount ↓</option>
+          <option value="amt_asc">Amount ↑</option>
+        </select>
+        <button id="exportCsv">Export CSV</button>
+        <span class="muted">Tip: filters apply to chart + table</span>
+      </div>
+    </section>
+
+    <!-- Top cards -->
+    <section class="grid cols-3">
+      <div class="card">
+        <h2>Totals by Type</h2>
+        <div id="totalsByType"></div>
+      </div>
+
+      <div class="card">
+        <h2>Upcoming Due Dates</h2>
+        <div id="dueDates"></div>
+      </div>
+
+      <div class="card">
+        <h2>Category Spend (Filtered)</h2>
+        <canvas id="catChart"></canvas>
+      </div>
+    </section>
+
+    <!-- Budgets -->
+    <section class="card">
+      <h2>Monthly Budgets</h2>
+      <div class="muted" style="margin-bottom:8px;">Tracks current month spend vs targets by top-level category.</div>
+      <div id="budgetsWrap"></div>
+    </section>
+
+    <!-- Trend -->
+    <section class="card">
+      <h2>Per-Account Trend (Monthly Net)</h2>
+      <canvas id="trendChart"></canvas>
+    </section>
+
+    <!-- Accounts -->
+    <section class="card">
+      <h2>Accounts</h2>
+      <div class="muted" style="margin-bottom:8px;">Balances are current snapshots from your institutions.</div>
+      <table id="accountsTable">
+        <thead>
+          <tr>
+            <th>Institution</th>
+            <th>Account</th>
+            <th>Type</th>
+            <th class="money">Balance</th>
+            <th>APR</th>
+            <th>Min Due</th>
+            <th>Due Date</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </section>
+
+    <!-- Transactions -->
+    <section class="card">
+      <div class="row" style="justify-content:space-between">
+        <h2>Transactions</h2>
+      </div>
+      <table id="txTable">
+        <thead>
+          <tr>
+            <th>Date</th>
+            <th>Name</th>
+            <th class="money">Amount</th>
+            <th>Category</th>
+            <th>Institution</th>
+            <th>Acct Nick</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </section>
+  </main>
+
+  <script>
+    // ====== CONFIG ======
+document.addEventListener("DOMContentLoaded",()=>{ try{document.getElementById("linkBtn").addEventListener("click", openLink);}catch(e){} try{document.getElementById("refreshBtn").addEventListener("click", ()=>doRefresh(false));}catch(e){} });
+    const API_BASE = ""; // same-origin API (Node serves both API and static)
+    const REFRESH_TOKEN = '188320ed631660df204d53df7a23e027a10419bad7263477';
+    const BUDGET_TARGETS = {
+      "Food and Drink": 600,
+      "Travel": 200,
+      "Shops": 400,
+      "Entertainment": 150,
+      "Transportation": 250,
+      "Healthcare": 150,
+      "General Services": 120,
+      "Rent and Utilities": 1200,
+      "Uncategorized": 100
+    };
+
+    const $ = (q, el=document)=>el.querySelector(q);
+    const fmtMoney = n=>{
+      if (n===""||n===null||typeof n==="undefined") return "";
+      const num=Number(n); const f=new Intl.NumberFormat(undefined,{style:'currency',currency:'USD'}).format(num);
+      return `<span class="money ${num<0?'warn':'ok'}">${f}</span>`;
+    };
+    const fmtPct = n=> (n||n===0)? `${Number(n).toFixed(2)}%` : "";
+    const fmtDate = d=> d ? new Date(d+"T00:00:00").toLocaleDateString() : "";
+
+    let RAW={}, accounts=[], txs=[];
+    let catChart, trendChart, plaidHandler;
+
+    // -------- Plaid Link ----------
+    async function createLinkToken() {
+      const r = await fetch(`${API_BASE}/api/create_link_token`, { method:'POST' });
+      if (!r.ok) throw new Error('create_link_token failed');
+      return (await r.json()).link_token;
+    }
+    async function openLink() {
+      try {
+        const link_token = await createLinkToken();
+        plaidHandler = Plaid.create({
+          token: link_token,
+          onSuccess: async (public_token, metadata) => {
+            await fetch(`${API_BASE}/api/exchange_public_token`, {
+              method:'POST',
+              headers:{'Content-Type':'application/json'},
+              body: JSON.stringify({ public_token, institution_name: metadata.institution?.name || null })
+            });
+            // After linking, build dashboard JSON then reload
+            await doRefresh(true);
+          },
+          onExit: (err, meta) => { /* no-op */ },
+        });
+        plaidHandler.open();
+      } catch (e) {
+        console.error(e);
+        alert('Plaid Link failed — check server logs.');
+      }
+    }
+
+    // -------- Dashboard data load / render ----------
+    async function load() {
+      const res = await fetch('/dashboard_data.json', { cache: 'no-store' });
+      if (!res.ok) throw new Error('Failed to load dashboard_data.json');
+      RAW = await res.json();
+      accounts = RAW.accounts || [];
+      txs = RAW.transactions || [];
+      initControls();
+      renderAll();
+    }
+
+    function initControls(){
+      const today = new Date();
+      const to = today.toISOString().slice(0,10);
+      const from = new Date(today.getTime()-29*86400000).toISOString().slice(0,10);
+      $('#fromDate').value = from;
+      $('#toDate').value = to;
+
+      const sel = $('#acctSelector');
+      sel.innerHTML = '<option value="">All Accounts (net)</option>';
+      const seen = new Set();
+      accounts.forEach(a=>{
+        const key = `${a.institution||''} • ${a.name||''}`;
+        if (seen.has(key)) return;
+        const opt = document.createElement('option');
+        opt.value = key; opt.textContent = key;
+        sel.appendChild(opt); seen.add(key);
+      });
+
+      ['fromDate','toDate','typeFilter','search','sortBy','acctSelector'].forEach(id=>{
+        $('#'+id).addEventListener('input', renderAll);
+        $('#'+id).addEventListener('change', renderAll);
+      });
+      $('#exportCsv').addEventListener('click', exportCsv);
+      $('#refreshBtn').addEventListener('click', ()=>doRefresh(false));
+      $('#linkBtn').addEventListener('click', openLink);
+    }
+
+    function applyFilters(list){
+      const q = ($('#search').value||'').toLowerCase();
+      const tfilter = $('#typeFilter').value;
+      const from = $('#fromDate').value;
+      const to = $('#toDate').value;
+      return list.filter(tx=>{
+        if (from && tx.date && tx.date < from) return false;
+        if (to && tx.date && tx.date > to) return false;
+        const amt = Number(tx.amount||0);
+        if (tfilter==='debits' && amt <= 0) return false;
+        if (tfilter==='credits' && amt >= 0) return false;
+        const hay = [tx.name||'', (tx.category||[]).join(' '), tx.institution||'', tx.nickname||''].join(' ').toLowerCase();
+        if (q && !hay.includes(q)) return false;
+        return true;
+      });
+    }
+    function sortTx(list){
+      const how = $('#sortBy').value, s = list.slice();
+      if (how==='date_desc') s.sort((a,b)=> (b.date||'').localeCompare(a.date||''));
+      if (how==='date_asc')  s.sort((a,b)=> (a.date||'').localeCompare(b.date||''));
+      if (how==='amt_desc')  s.sort((a,b)=> Number(b.amount||0)-Number(a.amount||0));
+      if (how==='amt_asc')   s.sort((a,b)=> Number(a.amount||0)-Number(b.amount||0));
+      return s;
+    }
+
+    function renderAll(){
+      $('#lastUpdated').textContent = 'Last updated: ' + new Date(RAW.last_updated || Date.now()).toLocaleString();
+      $('#acctCount').textContent = (accounts.length)+' accounts';
+      renderAccounts();
+      renderTotalsAndDues();
+      renderCategoryChart();
+      renderBudgets();
+      renderTrend();
+      renderTxTable();
+    }
+
+    function renderAccounts(){
+      const tb = $('#accountsTable tbody'); tb.innerHTML='';
+      accounts.forEach(a=>{
+        const bal = Number(a?.balances?.current ?? 0);
+        const type = (a.type||'other').toLowerCase();
+        const li=a.liability||{};
+        const tr=document.createElement('tr');
+        tr.innerHTML = `
+          <td>${a.institution||''}</td>
+          <td>${a.name||''}<div class="muted">${a.nickname? a.nickname+' • ':''}${a.mask? '••'+a.mask:''}</div></td>
+          <td>${type}${a.subtype? ' / '+a.subtype:''}</td>
+          <td>${fmtMoney(bal)}</td>
+          <td>${fmtPct(li.apr_percentage)}</td>
+          <td>${li.minimum_payment_amount? fmtMoney(li.minimum_payment_amount):''}</td>
+          <td>${fmtDate(li.next_payment_due_date)}</td>
+        `;
+        tb.appendChild(tr);
+      });
+      // Update the top totals pill
+      let totalCash=0,totalDebt=0;
+      accounts.forEach(a=>{
+        const bal=Number(a?.balances?.current ?? 0);
+        const t=(a.type||'').toLowerCase();
+        if(['depository','investment'].includes(t)) totalCash+=bal;
+        if(['credit','loan','other'].includes(t)) totalDebt+=bal;
+      });
+      $('#netTotals').textContent = `Cash ${new Intl.NumberFormat(undefined,{style:'currency',currency:'USD'}).format(totalCash)} • Debt ${new Intl.NumberFormat(undefined,{style:'currency',currency:'USD'}).format(totalDebt)}`;
+    }
+
+    function renderTotalsAndDues(){
+      let totalsByType = {};
+      accounts.forEach(a=>{
+        const bal = Number(a?.balances?.current ?? 0);
+        const type = (a.type||'other').toLowerCase();
+        totalsByType[type] = (totalsByType[type]||0) + bal;
+      });
+      const tt = $('#totalsByType'); tt.innerHTML='';
+      Object.entries(totalsByType).sort().forEach(([t,sum])=>{
+        const row=document.createElement('div'); row.className='row';
+        row.innerHTML=`<span class="tag">${t}</span><strong>${fmtMoney(sum)}</strong>`;
+        tt.appendChild(row);
+      });
+
+      const today = new Date();
+      const soon = new Date(today.getTime()+60*86400000);
+      const dues = accounts
+        .filter(a=>a.liability?.next_payment_due_date)
+        .map(a=>({inst:a.institution||'',name:a.name||'',min:a.liability?.minimum_payment_amount??'',due:a.liability?.next_payment_due_date||'',apr:a.liability?.apr_percentage??''}))
+        .filter(d=>{ const x=new Date(d.due+'T00:00:00'); return x>=today && x<=soon; })
+        .sort((a,b)=> (a.due||'').localeCompare(b.due||''));
+      const dueWrap = $('#dueDates'); dueWrap.innerHTML='';
+      if (!dues.length) dueWrap.innerHTML='<span class="muted">No upcoming due dates.</span>';
+      else dues.forEach(d=>{
+        const warn = (new Date(d.due+'T00:00:00') - today) < 7*86400000 ? 'warn' : '';
+        const div=document.createElement('div'); div.className='row';
+        div.innerHTML = `<div><div><strong>${d.inst}</strong> — ${d.name}</div><div class="muted">APR ${fmtPct(d.apr)} • Min ${fmtMoney(d.min)}</div></div><div class="${warn}">${fmtDate(d.due)}</div>`;
+        dueWrap.appendChild(div);
+      });
+    }
+
+    function renderCategoryChart(){
+      const filtered = sortTx(applyFilters(txs));
+      const catTotals = {};
+      filtered.forEach(t=>{
+        const amt=Number(t.amount||0);
+        if (amt<=0) return; // spending only
+        const cat = (t.category && t.category.length) ? t.category[0] : 'Uncategorized';
+        catTotals[cat] = (catTotals[cat]||0) + amt;
+      });
+      const labels = Object.keys(catTotals);
+      const data = Object.values(catTotals);
+      const ctx = $('#catChart').getContext('2d');
+      if (catChart) catChart.destroy();
+      catChart = new Chart(ctx, { type: 'doughnut', data: { labels, datasets: [{ data }] },
+        options: { plugins: { legend: { labels: { color:'#e7eef9' } } }, cutout: '55%' } });
+    }
+
+    function renderBudgets(){
+      const now = new Date();
+      const monthStart = new Date(now.getFullYear(), now.getMonth(), 1).toISOString().slice(0,10);
+      const monthEnd   = new Date(now.getFullYear(), now.getMonth()+1, 0).toISOString().slice(0,10);
+      const spend = {};
+      txs.forEach(t=>{
+        if (!t.date || t.date < monthStart || t.date > monthEnd) return;
+        const amt = Number(t.amount||0);
+        if (amt <= 0) return; // spend only
+        const cat = (t.category && t.category.length) ? t.category[0] : 'Uncategorized';
+        spend[cat] = (spend[cat]||0) + amt;
+      });
+      const wrap = $('#budgetsWrap'); wrap.innerHTML = '';
+      Object.keys(BUDGET_TARGETS).forEach(cat=>{
+        const target = Number(BUDGET_TARGETS[cat]||0);
+        const used = Number(spend[cat]||0);
+        const pct = target>0 ? Math.min(100, Math.round((used/target)*100)) : 0;
+        const status = used > target || pct>80 ? 'warn' : 'ok';
+        const row = document.createElement('div'); row.style.marginBottom='10px';
+        row.innerHTML = `
+          <div class="row" style="justify-content:space-between;margin-bottom:6px">
+            <strong>${cat}</strong>
+            <span>${fmtMoney(used)} / ${fmtMoney(target)} (${pct}%)</span>
+          </div>
+          <div class="bar"><span style="width:${pct}%; background:${status==='warn' ? '#fda4af' : '#7dd3fc'}"></span></div>`;
+        wrap.appendChild(row);
+      });
+    }
+
+    function renderTrend(){
+      const sel = $('#acctSelector').value;
+      const buckets = {}; const labelSet = new Set();
+      const [selInst] = sel ? sel.split(' • ') : [null,null];
+      txs.forEach(t=>{
+        const d = t.date; if (!d) return;
+        const ym = d.slice(0,7);
+        if (sel && (t.institution||'')!==selInst) return;
+        const amt = Number(t.amount||0);
+        const signAmt = (t.transaction_type==='credit' || amt<0) ? Math.abs(amt) : -Math.abs(amt);
+        buckets[ym] = (buckets[ym]||0) + signAmt;
+        labelSet.add(ym);
+      });
+      const labels = Array.from(labelSet).sort();
+      const data = labels.map(m=> Number(buckets[m]||0));
+      const ctx = $('#trendChart').getContext('2d');
+      if (trendChart) trendChart.destroy();
+      trendChart = new Chart(ctx, {
+        type: 'line',
+        data: { labels, datasets: [{ label: sel || 'All Accounts (net)', data, tension: 0.25 }] },
+        options: { plugins: { legend: { labels: { color:'#e7eef9' } } },
+          scales: { x: { ticks: { color:'#bcd1ff' }, grid:{ color:'#1f273a'} }, y: { ticks:{ color:'#bcd1ff'}, grid:{ color:'#1f273a'} } } }
+      });
+    }
+
+    function renderTxTable(){
+      let filtered = sortTx(applyFilters(txs));
+      $('#txCount').textContent = `${filtered.length} tx`;
+      const tb2 = $('#txTable tbody'); tb2.innerHTML='';
+      filtered.forEach(t=>{
+        const cats=(t.category||[]).join(' ▸ ');
+        const amt=Number(t.amount||0);
+        const displayAmt = (t.transaction_type==='credit' || amt<0) ? amt : -Math.abs(amt);
+        const tr=document.createElement('tr');
+        tr.innerHTML = `
+          <td>${fmtDate(t.date)}</td>
+          <td>${t.name||''}</td>
+          <td>${fmtMoney(displayAmt)}</td>
+          <td>${cats}</td>
+          <td>${t.institution||''}</td>
+          <td>${t.nickname||''}</td>`;
+        tb2.appendChild(tr);
+      });
+    }
+
+    function exportCsv(){
+      let rows = [['Date','Name','Amount','Category','Institution','Nickname']];
+      let filtered = sortTx(applyFilters(txs));
+      filtered.forEach(t=>{
+        rows.push([t.date||'', t.name||'', Number(t.amount||0), (t.category||[]).join(' > '), t.institution||'', t.nickname||'']);
+      });
+      const csv = rows.map(r=>r.map(x=>`"${String(x).replace(/"/g,'""')}"`).join(',')).join('\n');
+      const blob = new Blob([csv], {type:'text/csv;charset=utf-8;'});
+      const url = URL.createObjectURL(blob); const a = document.createElement('a');
+      a.href = url; a.download = 'transactions.csv'; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+    }
+
+    async function doRefresh(reloadAfter=true){
+      const btn = $('#refreshBtn'); btn.disabled = true; btn.textContent = 'Refreshing…';
+      try {
+        const r = await fetch(`${API_BASE}/refresh_dashboard`, { method:'POST', headers:{ 'X-Refresh-Token': REFRESH_TOKEN } });
+        if (!r.ok) throw new Error('Refresh failed');
+        if (reloadAfter) setTimeout(()=> location.reload(), 1200);
+      } catch (e) {
+        console.error(e); alert('Refresh failed. Check backend logs.');
+      } finally {
+        btn.disabled = false; btn.textContent = '🔄 Refresh Data';
+      }
+    }
+
+    load().catch(()=>{ $('#lastUpdated').textContent = 'No data yet. Click “Connect a bank” to begin.'; });
+  </script>
+<section id="linked-institutions" style="max-width:1100px;margin:32px auto;padding:16px;border:1px solid #e5e7eb;border-radius:16px;background:#fff">
+  <h3 style="margin:0 0 12px 0;font-size:18px;">Linked institutions</h3>
+  <div id="linked-institutions-list" style="display:grid;gap:8px"></div>
+  <small style="color:#6b7280">Use “Upgrade access” to grant Liabilities. Use “Remove” to unlink an institution.</small>
+</section>
+</body>
+</html>
+<script>
+(() => {
+  const ADMIN_TOKEN = '188320ed631660df204d53df7a23e027a10419bad7263477';
+  async function loadItems() {
+    const r = await fetch('/api/balances'); const j = await r.json();
+    const map = new Map();
+    (j.items||[]).forEach(it => {
+      if (it.error) return;
+      const label = (it.accounts && it.accounts[0] && (it.accounts[0].institution || it.accounts[0].official_name || it.accounts[0].name)) || 'Institution';
+      if (!map.has(it.item_id)) map.set(it.item_id, { item_id: it.item_id, label });
+    });
+    return Array.from(map.values());
+  }
+  function html(s, ...v){return s.reduce((a,b,i)=>a+b+(v[i]??''),'');}
+  async function renderPanel(){
+    const list = document.getElementById('linked-institutions-list'); if(!list) return;
+    list.innerHTML = '<div style="color:#6b7280">Loading…</div>';
+    const items = await loadItems();
+    if(!items.length){ list.innerHTML = '<div style="color:#6b7280">No institutions linked yet.</div>'; return; }
+    list.innerHTML='';
+    for(const {item_id,label} of items){
+      const row = document.createElement('div');
+      row.style.cssText='display:flex;align-items:center;justify-content:space-between;padding:10px 12px;border:1px solid #e5e7eb;border-radius:12px';
+      row.innerHTML = html`
+        <div style="display:flex;gap:8px;align-items:center">
+          <div style="width:8px;height:8px;border-radius:9999px;background:#10b981"></div>
+          <div><div style="font-weight:600">${label}</div>
+          <div style="color:#6b7280;font-size:12px">Item: <code>${item_id}</code></div></div>
+        </div>
+        <div style="display:flex;gap:8px">
+          <button data-upgrade="${item_id}" style="padding:6px 10px;border:1px solid #d1d5db;border-radius:10px;background:#f9fafb;cursor:pointer">Upgrade access</button>
+          <button data-remove="${item_id}" style="padding:6px 10px;border:1px solid #ef4444;border-radius:10px;background:#fef2f2;color:#b91c1c;cursor:pointer">Remove</button>
+        </div>`;
+      list.appendChild(row);
+    }
+    list.addEventListener('click', async (e)=>{
+      const up = e.target.closest('button[data-upgrade]');
+      const rm = e.target.closest('button[data-remove]');
+      if(up){
+        const item_id = up.getAttribute('data-upgrade');
+        try{
+          const r = await fetch('/api/link_token/update', {
+            method:'POST',
+            headers:{'Content-Type':'application/json','X-Admin-Token':ADMIN_TOKEN},
+            body: JSON.stringify({ item_id, products:['liabilities','transactions','assets'] })
+          });
+          const j = await r.json();
+          if(!r.ok || !j.link_token) throw new Error('failed_to_get_link_token');
+          const h = Plaid.create({ token: j.link_token, onSuccess: ()=>setTimeout(()=>location.reload(), 1500) });
+          h.open();
+        }catch(err){ alert('Upgrade failed: '+(err?.message||'unknown')); }
+      }
+      if(rm){
+        const item_id = rm.getAttribute('data-remove');
+        if(!confirm('Remove this institution? This unlinks it and deletes local data.')) return;
+        try{
+          const r = await fetch('/api/items/'+encodeURIComponent(item_id)+'/remove', {
+            method:'POST', headers:{'X-Admin-Token':ADMIN_TOKEN}
+          });
+          if(!r.ok) throw new Error('remove_failed');
+          await fetch('/refresh_dashboard', { method:'POST', headers:{'X-Refresh-Token':ADMIN_TOKEN} });
+          location.reload();
+        }catch(err){ alert('Remove failed: '+(err?.message||'unknown')); }
+      }
+    }, { once:true });
+  }
+  document.addEventListener('DOMContentLoaded', renderPanel);
+})();
+</script>

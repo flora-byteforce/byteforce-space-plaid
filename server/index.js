@@ -9,14 +9,40 @@ import { fileURLToPath } from 'url';
 import { dirname } from 'path';
 
 const app = express();
+const ADMIN_TOKEN = process.env.DASHBOARD_REFRESH_TOKEN;
+const adminGate = (req, res, next) => {
+  const t = req.get("X-Admin-Token");
+  if (!ADMIN_TOKEN || t !== ADMIN_TOKEN) return res.status(403).json({ error: "forbidden" });
+  next();
+};
 app.use(cors());
 app.use(express.json());
+const __ALLOWED_ORIGINS = (process.env.CORS_ORIGINS||"").split(",").map(s=>s.trim()).filter(Boolean);
+
+app.use((req,res,next)=>{ if(!__ALLOWED_ORIGINS.length) return next(); const o=req.headers.origin; if(!o || __ALLOWED_ORIGINS.includes(o)) return next(); return res.status(403).json({error:"origin_not_allowed"}); });
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 // --- DB setup ---
-const db = new Database(process.env.SQLITE_PATH, { verbose: null });
+const DB_PATH = process.env.DB_FILE || process.env.SQLITE_PATH || path.resolve(__dirname, "../data/plaid.db");
+const db = new Database(DB_PATH, { verbose: null });
+console.log("[db] using", DB_PATH);
+db.prepare("CREATE TABLE IF NOT EXISTS access_tokens (item_id TEXT PRIMARY KEY, access_token TEXT NOT NULL)").run();
+db.prepare("CREATE TABLE IF NOT EXISTS cursors (item_id TEXT PRIMARY KEY, cursor TEXT)").run();
+
+// Enable WAL (concurrency), reasonable durability, and foreign keys
+try {
+  db.pragma("journal_mode = WAL");
+  db.pragma("synchronous = NORMAL");
+  db.pragma("foreign_keys = ON");
+} catch (e) {
+  console.warn("PRAGMA init failed:", e?.message || String(e));
+}
+
+
+// Remove a linked Item (admin only): Plaid item/remove + delete local tokens/cursor
+
 db.exec(`
 CREATE TABLE IF NOT EXISTS items (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -185,7 +211,7 @@ app.post('/api/create_link_token', async (_req, res) => {
 });
 
 // Link update-mode
-app.post('/api/link_token/update', async (req, res) => {
+app.post('/api/link_token/update', adminGate, async (req, res) => {
   try {
     const { item_id, products } = req.body || {};
     const row = getOneItem.get(item_id);
@@ -468,16 +494,6 @@ app.get('/oauth-redirect', (_req, res) => {
 });
 
 // Serve static frontend
-app.get('/dashboard_data.json', async (req, res) => {
-  try {
-    const p = path.resolve(__dirname, '../web/dashboard_data.json');
-    const data = await fs.readFile(p, 'utf-8');
-    res.set('Cache-Control','no-store');
-    res.type('application/json').send(data);
-  } catch (e) {
-    res.status(404).json({ error: 'not_found', detail: String(e && e.message || e) });
-  }
-});
 app.use('/', express.static(`${__dirname}/../web`));
 
 // ===== Dashboard data builder: /refresh_dashboard =====
@@ -520,6 +536,18 @@ app.post('/refresh_dashboard', async (req, res) => {
   }
 });
 
+
+// Remove a linked Item (admin only): Plaid item/remove + delete local tokens/cursor
+
+
+// Remove a linked Item (admin only): Plaid item/remove + delete local tokens/cursor
+
+// ---- Start the server (loopback only) ----
+
+// ---- Start the server (loopback only) ----
+
+// ---- Start the server (loopback only) ----
+
 // ---- Start the server (loopback only) ----
 const port = Number(process.env.PORT || 8080);
 const host = process.env.HOST || '127.0.0.1';
@@ -527,3 +555,66 @@ app.listen(port, host, () => {
   const url = process.env.BASE_URL || `http://${host}:${port}`;
   console.log(`Server listening on ${url}`);
 });
+
+// --- injected health route for monitoring ---
+const __healthDbPath = process.env.SQLITE_PATH;
+app.get('/health', (_req, res) => {
+  try {
+    if (!__healthDbPath) return res.status(500).json({ ok:false, error:'Missing SQLITE_PATH' });
+    const _db = new Database(__healthDbPath, { fileMustExist: true });
+    const tables = _db.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").all().map(t=>t.name);
+    const mode = _db.pragma('journal_mode', { simple: true });
+    const fk   = _db.pragma('foreign_keys', { simple: true });
+    res.json({ ok:true, tables, journal_mode: mode, foreign_keys: fk });
+  } catch (e) {
+    res.status(500).json({ ok:false, error: e.message });
+  }
+});
+// === BEGIN REMOVE ITEM ROUTE (admin) ===
+const removeItemTx = db.transaction((item_id) => {
+  db.prepare('DELETE FROM access_tokens WHERE item_id = ?').run(item_id);
+  db.prepare('DELETE FROM cursors       WHERE item_id = ?').run(item_id);
+});
+
+app.post('/api/items/:item_id/remove', adminGate, async (req, res) => {
+  const { item_id } = req.params;
+
+  const log = (msg, obj) => {
+    const line = `[remove] ${new Date().toISOString()} ${msg} ${obj ? JSON.stringify(obj) : ''}\n`;
+    console.log(line.trim());
+    fs.appendFile('/opt/byteforce-space-plaid/server/remove.log', line).catch(()=>{});
+  };
+
+  try {
+    if (!item_id) {
+      log('missing_item_id');
+      return res.status(400).json({ error: 'missing_item_id' });
+    }
+
+    const row = db.prepare('SELECT access_token FROM access_tokens WHERE item_id = ?').get(item_id);
+    log('row', { found: !!row });
+    if (!row) {
+      log('item_not_found');
+      return res.status(404).json({ error: 'item_not_found' });
+    }
+
+    // Try Plaid itemRemove; continue even if Plaid fails
+    try {
+      const resp = await plaid.itemRemove({ access_token: row.access_token });
+      log('plaid_itemRemove_ok', { ok: !!(resp && resp.data) });
+    } catch (e) {
+      log('plaid_itemRemove_failed', { detail: e?.response?.data || e?.message || String(e) });
+    }
+
+    // Local delete in a transaction
+    removeItemTx(item_id);
+    log('local_delete_ok', { item_id });
+
+    log('done', { item_id });
+    return res.json({ ok: true, removed: item_id });
+  } catch (e) {
+    log('error', { detail: e?.response?.data || e?.message || String(e) });
+    return res.status(500).json({ error: 'remove_failed', detail: e?.response?.data || e?.message || String(e) });
+  }
+});
+// === END REMOVE ITEM ROUTE (admin) ===

@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Byteforce Budget</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <script src="https://cdn.plaid.com/link/v2/stable/link-initialize.js"></script>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 2rem; color: #0f172a; }
+    h1 { margin: 0 0 1rem 0; }
+    .row { display:flex; gap:.6rem; flex-wrap: wrap; align-items: center; }
+    button { padding:.6rem 1rem; border-radius:.6rem; border:1px solid #e2e8f0; background:#0ea5e9; color:white; cursor:pointer; }
+    button.secondary { background:#f1f5f9; color:#0f172a; }
+    table { border-collapse: collapse; width: 100%; margin-top: 1rem; }
+    th, td { border:1px solid #e2e8f0; padding:.5rem .6rem; font-size:14px; }
+    th { background:#f8fafc; text-align:left; }
+    .muted { color:#64748b; font-size: 12px; }
+    .badge { background:#f1f5f9; padding:.2rem .5rem; border-radius:.5rem; }
+    .section { margin-top:1.5rem; }
+    input[type="text"]{ padding:.4rem .6rem; border:1px solid #e2e8f0; border-radius:.5rem; }
+  </style>
+</head>
+<body>
+  <h1>Byteforce Budget</h1>
+
+  <div class="row">
+    <button id="link-btn">Connect a bank</button>
+    <button id="refresh-btn" class="secondary">Sync now</button>
+    <button id="force-btn" class="secondary">Force refresh (API)</button>
+    <label class="muted"><input type="checkbox" id="auto"> auto-sync every 15 min</label>
+    <span id="status" class="muted"></span>
+  </div>
+
+  <div class="row section">
+    <div><strong>Linked Items:</strong> <span id="itemCount" class="badge">0</span></div>
+    <div class="row"><input id="upgradeItem" placeholder="item_id for upgrade" />
+      <button id="upgradeBtn" class="secondary">Upgrade access</button>
+    </div>
+  </div>
+
+  <div id="balances"></div>
+
+  <div class="section">
+    <div class="row">
+      <button id="recurringBtn" class="secondary">Show recurring streams</button>
+      <button id="liabBtn" class="secondary">Show liabilities</button>
+    </div>
+    <div id="extra"></div>
+  </div>
+
+  <div class="section">
+    <div class="row">
+      <button id="assetCreateBtn" class="secondary">Create Asset Report (90d)</button>
+      <span id="assetInfo" class="muted"></span>
+    </div>
+    <div id="assetOut"></div>
+  </div>
+
+  <script>
+    const statusEl = document.getElementById('status');
+    const itemCountEl = document.getElementById('itemCount');
+    const balancesEl = document.getElementById('balances');
+    const extraEl = document.getElementById('extra');
+    const assetInfo = document.getElementById('assetInfo');
+    const autoCb = document.getElementById('auto');
+
+    function setStatus(msg) { statusEl.textContent = msg || ''; }
+
+    async function createLinkToken() {
+      const r = await fetch('/api/create_link_token', { method:'POST' });
+      if (!r.ok) throw new Error('link_token failed');
+      return (await r.json()).link_token;
+    }
+
+    async function openLink() {
+      setStatus('opening Plaid Link…');
+      try {
+        const link_token = await createLinkToken();
+        const handler = Plaid.create({
+          token: link_token,
+          onSuccess: async (public_token, metadata) => {
+            setStatus('exchanging token…');
+            await fetch('/api/exchange_public_token', {
+              method:'POST',
+              headers:{'Content-Type':'application/json'},
+              body: JSON.stringify({ public_token, institution_name: metadata.institution?.name || null })
+            });
+            setStatus('linked ✓');
+            await reloadAll();
+          },
+          onExit: () => setStatus(''),
+        });
+        handler.open();
+      } catch (e) {
+        console.error(e);
+        setStatus('Link failed');
+      }
+    }
+
+    async function getItems() {
+      const r = await fetch('/api/items');
+      const data = await r.json();
+      itemCountEl.textContent = data.length;
+      return data.map(i => i.item_id);
+    }
+
+    function fmt(n) {
+      try { return new Intl.NumberFormat(undefined, { style:'currency', currency:'USD' }).format(n); }
+      catch { return n; }
+    }
+
+    async function loadBalances() {
+      const r = await fetch('/api/balances');
+      const data = await r.json();
+      const rows = [];
+      (data.items || []).forEach(it => {
+        (it.accounts || []).forEach(a => {
+          rows.push({
+            item_id: it.item_id,
+            name: a.name || a.official_name || a.mask || a.account_id,
+            subtype: a.subtype || a.type,
+            available: a.balances?.available,
+            current: a.balances?.current
+          });
+        });
+      });
+      let html = '<table><thead><tr><th>Item</th><th>Account</th><th>Type</th><th>Available</th><th>Current</th></tr></thead><tbody>';
+      rows.forEach(r => {
+        html += `<tr><td class="muted">${r.item_id}</td><td>${r.name}</td><td>${r.subtype||''}</td><td>${r.available==null?'':fmt(r.available)}</td><td>${r.current==null?'':fmt(r.current)}</td></tr>`;
+      });
+      html += '</tbody></table>';
+      balancesEl.innerHTML = html;
+    }
+
+    async function refreshAll() {
+      setStatus('syncing transactions across all items…');
+      const r = await fetch('/api/transactions/sync-all', { method:'POST' });
+      if (!r.ok) { setStatus('sync failed'); return; }
+      const d = await r.json();
+      setStatus(`sync complete: ${d.total_added} new tx`);
+    }
+
+    async function forceRefresh() {
+      setStatus('requesting on-demand refresh…');
+      await fetch('/api/transactions/refresh-all', { method:'POST' });
+      // give Plaid a moment to fetch, then sync & reload balances
+      setTimeout(async () => { await refreshAll(); await loadBalances(); }, 4000);
+    }
+
+    async function showRecurring() {
+      const r = await fetch('/api/transactions/recurring');
+      const data = await r.json();
+      const rows = [];
+      (data.items||[]).forEach(it => {
+        const both = []
+          .concat((it.inflow_streams||[]).map(s => ({dir:'inflow', ...s})))
+          .concat((it.outflow_streams||[]).map(s => ({dir:'outflow', ...s})));
+        both.forEach(s => rows.push({
+          item_id: it.item_id,
+          dir: s.dir,
+          name: s.merchant_name || s.category || s.description || '(stream)',
+          last_amount: s.last_amount,
+          frequency: s.frequency || s.cadence,
+          status: s.status || ''
+        }));
+      });
+      let html = '<h3>Recurring streams</h3><table><thead><tr><th>Item</th><th>Dir</th><th>Name</th><th>Last amount</th><th>Frequency</th><th>Status</th></tr></thead><tbody>';
+      rows.forEach(r => { html += `<tr><td class="muted">${r.item_id}</td><td>${r.dir}</td><td>${r.name}</td><td>${fmt(r.last_amount||0)}</td><td>${r.frequency||''}</td><td>${r.status||''}</td></tr>`; });
+      html += '</tbody></table>';
+      extraEl.innerHTML = html;
+    }
+
+    async function showLiabilities() {
+      const r = await fetch('/api/liabilities');
+      const data = await r.json();
+      let rows = [];
+      (data.items||[]).forEach(it => {
+        if (it.liabilities?.credit) {
+          it.liabilities.credit.forEach(c => rows.push({ item_id: it.item_id, type:'credit', name:c.account_id, apr:c.apr?.apr_percentage, min:c.minimum_payment_amount, due:c.next_payment_due_date }));
+        }
+        if (it.liabilities?.student) {
+          it.liabilities.student.forEach(s => rows.push({ item_id: it.item_id, type:'student', name:s.account_id, min:s.minimum_payment_amount, due:s.next_payment_due_date }));
+        }
+        if (it.liabilities?.mortgage) {
+          it.liabilities.mortgage.forEach(m => rows.push({ item_id: it.item_id, type:'mortgage', name:m.account_id, orig:m.origination_principal_amount, due:m.next_payment_due_date }));
+        }
+      });
+      let html = '<h3>Liabilities</h3><table><thead><tr><th>Item</th><th>Type</th><th>Account</th><th>APR/Orig</th><th>Min</th><th>Due</th></tr></thead><tbody>';
+      rows.forEach(r => { html += `<tr><td class="muted">${r.item_id}</td><td>${r.type}</td><td>${r.name}</td><td>${r.apr??r.orig??''}</td><td>${r.min??''}</td><td>${r.due??''}</td></tr>`; });
+      html += '</tbody></table>';
+      extraEl.innerHTML = html;
+    }
+
+    async function createAssetReport() {
+      assetInfo.textContent = 'creating asset report…';
+      const r = await fetch('/api/assets/create', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ days_requested: 90 }) });
+      const d = await r.json();
+      if (!r.ok) { assetInfo.textContent = 'asset create failed'; return; }
+      const token = d.asset_report_token;
+      assetInfo.textContent = `report token: ${token} (polling…)`;
+      const poll = async () => {
+        const s = await fetch('/api/assets/get?token='+encodeURIComponent(token));
+        if (s.status === 202) { setTimeout(poll, 3000); return; }
+        const json = await s.json();
+        document.getElementById('assetOut').innerHTML =
+          '<pre style="white-space:pre-wrap">'+JSON.stringify({ items: json.report?.items?.length, accounts: json.report?.items?.reduce((a,b)=>a+(b.accounts?.length||0),0) }, null, 2)+'</pre>'
+          + `<a href="/api/assets/pdf?token=${encodeURIComponent(token)}" target="_blank">Download PDF</a>`;
+        assetInfo.textContent = 'asset report ready ✓';
+      };
+      setTimeout(poll, 3000);
+    }
+
+    async function reloadAll() { await getItems(); await loadBalances(); }
+
+    document.getElementById('link-btn').addEventListener('click', openLink);
+    document.getElementById('refresh-btn').addEventListener('click', async () => { await refreshAll(); await loadBalances(); });
+    document.getElementById('force-btn').addEventListener('click', forceRefresh);
+    document.getElementById('recurringBtn').addEventListener('click', showRecurring);
+    document.getElementById('liabBtn').addEventListener('click', showLiabilities);
+    document.getElementById('assetCreateBtn').addEventListener('click', createAssetReport);
+
+    // update-mode (upgrade consent)
+    document.getElementById('upgradeBtn').addEventListener('click', async () => {
+      const item_id = document.getElementById('upgradeItem').value.trim();
+      if (!item_id) { alert('Enter an item_id'); return; }
+      setStatus('opening update mode…');
+      try {
+        const r = await fetch('/api/link_token/update', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ item_id }) });
+        const { link_token } = await r.json();
+        const handler = Plaid.create({
+          token: link_token,
+          onSuccess: () => setStatus('upgraded ✓'),
+          onExit: () => setStatus(''),
+        });
+        handler.open();
+      } catch (e) { console.error(e); setStatus('update mode failed'); }
+    });
+
+    // auto-sync every 15 minutes (optional)
+    autoCb.addEventListener('change', () => {
+      if (autoCb.checked) { localStorage.setItem('auto', '1'); tick(); }
+      else { localStorage.removeItem('auto'); }
+    });
+    function tick(){ if (!autoCb.checked) return; (async()=>{ await refreshAll(); await loadBalances(); })(); setTimeout(tick, 15*60*1000); }
+    if (localStorage.getItem('auto')==='1') { autoCb.checked = true; tick(); }
+
+    (async ()=>{ await reloadAll(); })();
+  </script>
+</body>
+</html>
